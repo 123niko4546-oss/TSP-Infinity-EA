@@ -10,7 +10,8 @@ private:
 
    long   m_signalKey;
    int    m_direction;
-   double m_lockedSAR1;
+   double   m_liveSAR1;
+   datetime m_lastH1BarTime;
    double m_previousBid;
    double m_previousAsk;
    bool   m_armed;
@@ -24,7 +25,8 @@ private:
    {
       m_signalKey = signalKey;
       m_direction = direction;
-      m_lockedSAR1 = 0.0;
+      m_liveSAR1 = 0.0;
+      m_lastH1BarTime = 0;
       m_previousBid = currentBid;
       m_previousAsk = currentAsk;
       m_armed = false;
@@ -37,21 +39,27 @@ private:
             " Ask=",DoubleToString(currentAsk,Digits));
    }
 
-   void ArmLevel(double sar1,
-                 double currentBid,
-                 double currentAsk)
+   void SetLiveLevel(double sar1,
+                     datetime h1BarTime,
+                     double currentBid,
+                     double currentAsk,
+                     bool initialArm)
    {
-      // The exact penultimate point is locked once and is never moved
-      // while the same signal remains active.
-      m_lockedSAR1 = NormalizeDouble(sar1, Digits);
+      // SAR[1] belongs to the last closed H1 candle. It is refreshed only
+      // when a new H1 candle begins, never on every tick.
+      m_liveSAR1 = NormalizeDouble(sar1, Digits);
+      m_lastH1BarTime = h1BarTime;
       m_previousBid = currentBid;
       m_previousAsk = currentAsk;
       m_armed = true;
       m_touchDetected = false;
 
-      Print("[TSP4][SAR1_LOCK] key=", m_signalKey,
+      Print(initialArm ? "[TSP5.3][SAR1_LIVE_ARM] key="
+                       : "[TSP5.3][SAR1_LIVE_UPDATE] key=",
+            m_signalKey,
             " direction=", TSP4_DirectionText(m_direction),
-            " lockedSAR1=", DoubleToString(m_lockedSAR1, Digits),
+            " liveSAR1=", DoubleToString(m_liveSAR1, Digits),
+            " H1Bar=", TimeToString(m_lastH1BarTime, TIME_DATE|TIME_MINUTES),
             " Bid=", DoubleToString(currentBid, Digits),
             " Ask=", DoubleToString(currentAsk, Digits));
    }
@@ -93,7 +101,8 @@ public:
       m_reason = "";
       m_signalKey = 0;
       m_direction = TSP4_DIR_NONE;
-      m_lockedSAR1 = 0.0;
+      m_liveSAR1 = 0.0;
+      m_lastH1BarTime = 0;
       m_previousBid = 0.0;
       m_previousAsk = 0.0;
       m_armed = false;
@@ -144,72 +153,76 @@ public:
          return(false);
       }
 
-      // Until armed, inspect the current penultimate H1 SAR point.
-      // Once armed, the selected SAR[1] is locked and never replaced
-      // by later SAR points for this signal.
-      if(!m_armed)
+      // SAR[1] is the penultimate point of the last closed H1 candle.
+      // Refresh it only when a new H1 candle begins. This prevents the EA
+      // from waiting indefinitely for an obsolete level.
+      datetime currentH1BarTime = iTime(symbol, PERIOD_H1, 0);
+      bool newH1Bar = (currentH1BarTime > 0 &&
+                       currentH1BarTime != m_lastH1BarTime);
+
+      if(!m_armed || (!m_touchDetected && newH1Bar))
       {
          double candidateSAR1 = ind.Sar(symbol, PERIOD_H1, 1);
 
          if(candidateSAR1 <= 0.0)
          {
-            m_reason = "Invalid H1 SAR[1]";
+            m_reason = "Invalid live H1 SAR[1]";
             return(false);
          }
 
          bool correctSide = false;
 
-         // BUY: the penultimate SAR point must be below price.
-         // Price approaches it from above.
          if(signal.direction == TSP4_DIR_BUY)
             correctSide = (candidateSAR1 < currentBid);
 
-         // SELL: the penultimate SAR point must be above price.
-         // Price approaches it from below.
          if(signal.direction == TSP4_DIR_SELL)
             correctSide = (candidateSAR1 > currentAsk);
+
+         bool initialArm = !m_armed;
+         SetLiveLevel(candidateSAR1,
+                      currentH1BarTime,
+                      currentBid,
+                      currentAsk,
+                      initialArm);
 
          if(!correctSide)
          {
             m_reason =
-               "Waiting SAR[1] on entry side direction=" +
+               "Waiting live SAR[1] on entry side direction=" +
                TSP4_DirectionText(signal.direction) +
-               " SAR1=" + DoubleToString(candidateSAR1, Digits) +
+               " LiveSAR1=" + DoubleToString(m_liveSAR1, Digits) +
                " Bid=" + DoubleToString(currentBid, Digits) +
                " Ask=" + DoubleToString(currentAsk, Digits);
             return(false);
          }
 
-         ArmLevel(candidateSAR1,
-                  currentBid,
-                  currentAsk);
-
          m_reason =
-            "Locked penultimate SAR[1]=" +
-            DoubleToString(m_lockedSAR1, Digits) +
-            " direction=" +
-            TSP4_DirectionText(signal.direction);
+            (initialArm ? "Armed live SAR[1]=" : "Updated live SAR[1]=") +
+            DoubleToString(m_liveSAR1, Digits) +
+            " direction=" + TSP4_DirectionText(signal.direction);
 
+         // Start crossing detection from the next tick. Comparing the price
+         // before an H1 level update with the new level can create a false touch.
          return(false);
       }
 
-      // Detect the first crossing of the LOCKED penultimate SAR point.
+      // Detect the first crossing of the current live penultimate SAR point.
       if(!m_touchDetected)
       {
          if(signal.direction == TSP4_DIR_BUY)
          {
             // BUY SAR is below price: detect the first downward touch.
             m_touchDetected =
-               (m_previousBid > m_lockedSAR1 &&
-                currentBid <= m_lockedSAR1);
+               (m_previousBid > m_liveSAR1 &&
+                currentBid <= m_liveSAR1);
          }
 
          if(signal.direction == TSP4_DIR_SELL)
          {
             // SELL SAR is above price: detect the first upward touch.
             m_touchDetected =
-               (m_previousAsk < m_lockedSAR1 &&
-                currentAsk >= m_lockedSAR1);
+               (m_previousAsk < m_liveSAR1 &&
+                currentAsk >= m_liveSAR1);
          }
 
          m_previousBid = currentBid;
@@ -218,9 +231,9 @@ public:
          if(!m_touchDetected)
          {
             m_reason =
-               "Waiting locked SAR[1] touch direction=" +
+               "Waiting live SAR[1] touch direction=" +
                TSP4_DirectionText(signal.direction) +
-               " LockedSAR1=" + DoubleToString(m_lockedSAR1, Digits) +
+               " LiveSAR1=" + DoubleToString(m_liveSAR1, Digits) +
                " Bid=" + DoubleToString(currentBid, Digits) +
                " Ask=" + DoubleToString(currentAsk, Digits);
             return(false);
@@ -228,7 +241,7 @@ public:
 
          Print("[TSP4][SAR1_TOUCH] key=", signal.key,
                " direction=", TSP4_DirectionText(signal.direction),
-               " lockedSAR1=", DoubleToString(m_lockedSAR1, Digits),
+               " liveSAR1=", DoubleToString(m_liveSAR1, Digits),
                " Bid=", DoubleToString(currentBid, Digits),
                " Ask=", DoubleToString(currentAsk, Digits));
       }
@@ -281,7 +294,7 @@ public:
       double gap = 0.0;
 
       if(sar0 > 0.0)
-         gap = MathAbs(m_lockedSAR1 - sar0);
+         gap = MathAbs(m_liveSAR1 - sar0);
 
       if(gap < brokerMinGap)
          gap = brokerMinGap;
@@ -291,10 +304,10 @@ public:
       double stop = 0.0;
 
       if(signal.direction == TSP4_DIR_BUY)
-         stop = NormalizeDouble(m_lockedSAR1 - gap, Digits);
+         stop = NormalizeDouble(m_liveSAR1 - gap, Digits);
 
       if(signal.direction == TSP4_DIR_SELL)
-         stop = NormalizeDouble(m_lockedSAR1 + gap, Digits);
+         stop = NormalizeDouble(m_liveSAR1 + gap, Digits);
 
       if(stop <= 0.0 || gap <= Point)
       {
@@ -304,20 +317,20 @@ public:
 
       Print("[TSP4][INITIAL_EMERGENCY_SL] key=", signal.key,
             " direction=", TSP4_DirectionText(signal.direction),
-            " Entry=", DoubleToString(m_lockedSAR1, Digits),
+            " Entry=", DoubleToString(m_liveSAR1, Digits),
             " SAR0=", DoubleToString(sar0, Digits),
             " EmergencySL=", DoubleToString(stop, Digits),
             " Gap=", DoubleToString(gap, Digits));
 
       FillPlan(symbol,
                signal,
-               m_lockedSAR1,
+               m_liveSAR1,
                stop,
                gap,
                plan);
 
       m_reason =
-         "Immediate locked SAR[1] touch entry ready Entry=" +
+         "Immediate live SAR[1] touch entry ready Entry=" +
          DoubleToString(plan.entry, Digits) +
          " SL=" + DoubleToString(plan.stopLoss, Digits) +
          " Gap=" + DoubleToString(plan.gap, Digits);

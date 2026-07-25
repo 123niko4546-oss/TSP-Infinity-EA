@@ -3,10 +3,10 @@
 //| Clean MT4 architecture                                           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "5.010"
-#property description "TSP Infinity EA v5.1 Debug - Signal 3 priority and corrected H1 SAR direction."
+#property version   "5.300"
+#property description "TSP Infinity EA v5.3 Live SAR[1] Entry Engine."
 
-#define TSP_VERSION "5.1 Debug Signal Priority + SAR Direction Fix"
+#define TSP_VERSION "5.3 Live SAR[1] Entry Engine"
 
 #include "TSP4_Types.mqh"
 #include "TSP4_Indicators.mqh"
@@ -32,13 +32,13 @@ input int    Inp_MaxSpreadPoints             = 100;
 input bool   Inp_OneActiveSeriesPerSymbol    = true;
 input bool   Inp_Debug                       = true;
 input bool   Inp_EnableProfessionalDiagnostics = true;
-input bool   Inp_DiagnosticEveryTick         = true;
+input bool   Inp_DiagnosticEveryTick         = false;
 input int    Inp_DiagnosticThrottleSeconds    = 1;
 input bool   Inp_BlockExpiredSignals           = true;
 input bool   Inp_V5DecisionTrace               = true;
 input bool   Inp_V5TraceEveryTick               = false;
 input bool   Inp_V5WriteCsv                     = true;
-input string Inp_V5CsvFile                      = "TSP_Infinity_v5_Debug_Trace.csv";
+input string Inp_V5CsvFile                      = "TSP_Infinity_v5_3_Live_SAR_Trace.csv";
 
 // MACD2
 input string Inp_MACD2_Name                  = "MACD2";
