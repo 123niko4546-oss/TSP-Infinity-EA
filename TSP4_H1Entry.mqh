@@ -1,113 +1,344 @@
 #ifndef __TSP4_H1_ENTRY_MQH__
 #define __TSP4_H1_ENTRY_MQH__
 
+// TSP Infinity EA v5.4
+// H1 SAR entry state machine.
+//
+// Core rules:
+// 1. A new signal starts a new state machine.
+// 2. SAR[1] is locked once, only when it is on the valid entry side.
+// 3. The locked SAR[1] is never refreshed while the signal remains active.
+// 4. A detected touch remains latched.
+// 5. After the touch, the engine waits only for protective SAR[0] geometry.
+// 6. BUY requires SAR[0] < locked SAR[1].
+// 7. SELL requires SAR[0] > locked SAR[1].
+// 8. Entry = locked SAR[1], SL = protective SAR[0].
+// 9. Gap = absolute distance between locked SAR[1] and protective SAR[0].
+
+enum ETSP54H1State
+{
+   TSP54_H1_IDLE = 0,
+   TSP54_H1_WAIT_LOCK,
+   TSP54_H1_WAIT_TOUCH,
+   TSP54_H1_TOUCH_LATCHED,
+   TSP54_H1_WAIT_PROTECTIVE_SAR0,
+   TSP54_H1_ENTRY_READY,
+   TSP54_H1_CONSUMED
+};
+
 class CTSP4H1Entry
 {
 private:
-   int    m_lookback;
-   int    m_tolerancePoints;
-   string m_reason;
+   int      m_lookback;
+   int      m_tolerancePoints;
+   string   m_reason;
 
-   long   m_signalKey;
-   int    m_direction;
-   double   m_liveSAR1;
-   datetime m_lastH1BarTime;
-   double m_previousBid;
-   double m_previousAsk;
-   bool   m_armed;
-   bool   m_touchDetected;
-   bool   m_consumed;
+   long     m_signalKey;
+   int      m_direction;
+   int      m_state;
 
-   void ResetForSignal(long signalKey,
-                       int direction,
-                       double currentBid,
-                       double currentAsk)
+   double   m_lockedSAR1;
+   double   m_previousBid;
+   double   m_previousAsk;
+
+   datetime m_lockH1BarTime;
+   datetime m_touchTime;
+
+   bool     m_consumed;
+
+   string StateText(const int state)
    {
-      m_signalKey = signalKey;
-      m_direction = direction;
-      m_liveSAR1 = 0.0;
-      m_lastH1BarTime = 0;
-      m_previousBid = currentBid;
-      m_previousAsk = currentAsk;
-      m_armed = false;
-      m_touchDetected = false;
-      m_consumed = false;
+      switch(state)
+      {
+         case TSP54_H1_IDLE:                 return("IDLE");
+         case TSP54_H1_WAIT_LOCK:            return("WAIT_LOCK");
+         case TSP54_H1_WAIT_TOUCH:           return("WAIT_TOUCH");
+         case TSP54_H1_TOUCH_LATCHED:        return("TOUCH_LATCHED");
+         case TSP54_H1_WAIT_PROTECTIVE_SAR0: return("WAIT_PROTECTIVE_SAR0");
+         case TSP54_H1_ENTRY_READY:          return("ENTRY_READY");
+         case TSP54_H1_CONSUMED:             return("CONSUMED");
+      }
 
-      Print("[TSP5][H1_TRACKER_RESET] key=",m_signalKey,
-            " direction=",TSP4_DirectionText(m_direction),
-            " Bid=",DoubleToString(currentBid,Digits),
-            " Ask=",DoubleToString(currentAsk,Digits));
+      return("UNKNOWN");
    }
 
-   void SetLiveLevel(double sar1,
-                     datetime h1BarTime,
-                     double currentBid,
-                     double currentAsk,
-                     bool initialArm)
+   void SetState(const int newState, const string reason)
    {
-      // SAR[1] belongs to the last closed H1 candle. It is refreshed only
-      // when a new H1 candle begins, never on every tick.
-      m_liveSAR1 = NormalizeDouble(sar1, Digits);
-      m_lastH1BarTime = h1BarTime;
-      m_previousBid = currentBid;
-      m_previousAsk = currentAsk;
-      m_armed = true;
-      m_touchDetected = false;
+      bool changed = (m_state != newState);
 
-      Print(initialArm ? "[TSP5.3][SAR1_LIVE_ARM] key="
-                       : "[TSP5.3][SAR1_LIVE_UPDATE] key=",
-            m_signalKey,
+      m_state  = newState;
+      m_reason = reason;
+
+      if(changed)
+      {
+         Print("[TSP5.4][H1_STATE] key=", m_signalKey,
+               " direction=", TSP4_DirectionText(m_direction),
+               " state=", StateText(m_state),
+               " reason=", m_reason);
+      }
+   }
+
+   void ResetForSignal(const long signalKey,
+                       const int direction,
+                       const double currentBid,
+                       const double currentAsk)
+   {
+      m_signalKey    = signalKey;
+      m_direction    = direction;
+      m_state        = TSP54_H1_WAIT_LOCK;
+      m_lockedSAR1   = 0.0;
+      m_previousBid  = currentBid;
+      m_previousAsk  = currentAsk;
+      m_lockH1BarTime = 0;
+      m_touchTime    = 0;
+      m_consumed     = false;
+
+      m_reason = "New signal; waiting valid SAR[1] lock";
+
+      Print("[TSP5.4][H1_RESET] key=", m_signalKey,
             " direction=", TSP4_DirectionText(m_direction),
-            " liveSAR1=", DoubleToString(m_liveSAR1, Digits),
-            " H1Bar=", TimeToString(m_lastH1BarTime, TIME_DATE|TIME_MINUTES),
             " Bid=", DoubleToString(currentBid, Digits),
             " Ask=", DoubleToString(currentAsk, Digits));
    }
 
-   void FillPlan(string symbol,
+   bool DirectionIsValid(const int direction)
+   {
+      return(direction == TSP4_DIR_BUY ||
+             direction == TSP4_DIR_SELL);
+   }
+
+   bool CandidateSAR1OnEntrySide(const double sar1,
+                                 const double currentBid,
+                                 const double currentAsk)
+   {
+      if(m_direction == TSP4_DIR_BUY)
+         return(sar1 < currentBid);
+
+      if(m_direction == TSP4_DIR_SELL)
+         return(sar1 > currentAsk);
+
+      return(false);
+   }
+
+   bool LockSAR1(const string symbol,
+                 CTSP4Indicators &ind,
+                 const double currentBid,
+                 const double currentAsk)
+   {
+      double candidateSAR1 = ind.Sar(symbol, PERIOD_H1, 1);
+
+      if(candidateSAR1 <= 0.0)
+      {
+         SetState(TSP54_H1_WAIT_LOCK,
+                  "Waiting valid H1 SAR[1]");
+         return(false);
+      }
+
+      candidateSAR1 = NormalizeDouble(candidateSAR1, Digits);
+
+      if(!CandidateSAR1OnEntrySide(candidateSAR1,
+                                   currentBid,
+                                   currentAsk))
+      {
+         SetState(
+            TSP54_H1_WAIT_LOCK,
+            "Waiting SAR[1] on entry side direction=" +
+            TSP4_DirectionText(m_direction) +
+            " SAR1=" + DoubleToString(candidateSAR1, Digits) +
+            " Bid=" + DoubleToString(currentBid, Digits) +
+            " Ask=" + DoubleToString(currentAsk, Digits)
+         );
+         return(false);
+      }
+
+      m_lockedSAR1    = candidateSAR1;
+      m_lockH1BarTime = iTime(symbol, PERIOD_H1, 0);
+      m_previousBid   = currentBid;
+      m_previousAsk   = currentAsk;
+
+      SetState(
+         TSP54_H1_WAIT_TOUCH,
+         "SAR[1] locked once at " +
+         DoubleToString(m_lockedSAR1, Digits)
+      );
+
+      Print("[TSP5.4][SAR1_LOCKED] key=", m_signalKey,
+            " direction=", TSP4_DirectionText(m_direction),
+            " SAR1=", DoubleToString(m_lockedSAR1, Digits),
+            " H1Bar=", TimeToString(m_lockH1BarTime,
+                                    TIME_DATE|TIME_MINUTES),
+            " Bid=", DoubleToString(currentBid, Digits),
+            " Ask=", DoubleToString(currentAsk, Digits));
+
+      return(true);
+   }
+
+   bool DetectTouch(const double currentBid,
+                    const double currentAsk)
+   {
+      double tolerance =
+         MathMax(1, m_tolerancePoints) * Point;
+
+      bool touched = false;
+
+      if(m_direction == TSP4_DIR_BUY)
+      {
+         touched =
+            (m_previousBid > m_lockedSAR1 + tolerance &&
+             currentBid <= m_lockedSAR1 + tolerance);
+      }
+      else if(m_direction == TSP4_DIR_SELL)
+      {
+         touched =
+            (m_previousAsk < m_lockedSAR1 - tolerance &&
+             currentAsk >= m_lockedSAR1 - tolerance);
+      }
+
+      m_previousBid = currentBid;
+      m_previousAsk = currentAsk;
+
+      if(!touched)
+      {
+         SetState(
+            TSP54_H1_WAIT_TOUCH,
+            "Waiting locked SAR[1] touch direction=" +
+            TSP4_DirectionText(m_direction) +
+            " LockedSAR1=" +
+            DoubleToString(m_lockedSAR1, Digits) +
+            " Bid=" + DoubleToString(currentBid, Digits) +
+            " Ask=" + DoubleToString(currentAsk, Digits)
+         );
+         return(false);
+      }
+
+      m_touchTime = TimeCurrent();
+
+      SetState(
+         TSP54_H1_TOUCH_LATCHED,
+         "SAR[1] touch latched at " +
+         DoubleToString(m_lockedSAR1, Digits)
+      );
+
+      Print("[TSP5.4][SAR1_TOUCH_LATCHED] key=", m_signalKey,
+            " direction=", TSP4_DirectionText(m_direction),
+            " SAR1=", DoubleToString(m_lockedSAR1, Digits),
+            " Bid=", DoubleToString(currentBid, Digits),
+            " Ask=", DoubleToString(currentAsk, Digits),
+            " Time=", TimeToString(m_touchTime,
+                                   TIME_DATE|TIME_SECONDS));
+
+      return(true);
+   }
+
+   bool ProtectiveSAR0Ready(const string symbol,
+                            CTSP4Indicators &ind,
+                            double &sar0,
+                            double &gap)
+   {
+      sar0 = ind.Sar(symbol, PERIOD_H1, 0);
+
+      if(sar0 <= 0.0)
+      {
+         SetState(TSP54_H1_WAIT_PROTECTIVE_SAR0,
+                  "Touch latched; waiting valid protective SAR[0]");
+         return(false);
+      }
+
+      sar0 = NormalizeDouble(sar0, Digits);
+
+      bool geometryOk = false;
+
+      // Protective reversal geometry:
+      // BUY  -> current SAR[0] must be below locked SAR[1].
+      // SELL -> current SAR[0] must be above locked SAR[1].
+      if(m_direction == TSP4_DIR_BUY)
+         geometryOk = (sar0 < m_lockedSAR1);
+
+      if(m_direction == TSP4_DIR_SELL)
+         geometryOk = (sar0 > m_lockedSAR1);
+
+      if(!geometryOk)
+      {
+         SetState(
+            TSP54_H1_WAIT_PROTECTIVE_SAR0,
+            "Touch latched; waiting protective SAR[0] flip direction=" +
+            TSP4_DirectionText(m_direction) +
+            " LockedSAR1=" +
+            DoubleToString(m_lockedSAR1, Digits) +
+            " SAR0=" + DoubleToString(sar0, Digits)
+         );
+         return(false);
+      }
+
+      gap = MathAbs(m_lockedSAR1 - sar0);
+      gap = NormalizeDouble(gap, Digits);
+
+      if(gap <= Point)
+      {
+         SetState(
+            TSP54_H1_WAIT_PROTECTIVE_SAR0,
+            "Invalid SAR reversal gap; waiting direction=" +
+            TSP4_DirectionText(m_direction) +
+            " LockedSAR1=" +
+            DoubleToString(m_lockedSAR1, Digits) +
+            " SAR0=" + DoubleToString(sar0, Digits) +
+            " Gap=" + DoubleToString(gap, Digits)
+         );
+         return(false);
+      }
+
+      return(true);
+   }
+
+   void FillPlan(const string symbol,
                  STSP4_Signal &signal,
-                 double entry,
-                 double stop,
-                 double gap,
+                 const double entry,
+                 const double stop,
+                 const double gap,
                  STSP4_TradePlan &plan)
    {
-      plan.symbol = symbol;
-      plan.signalKey = signal.key;
-      plan.signalType = signal.type;
-      plan.direction = signal.direction;
-      plan.entry = NormalizeDouble(entry, Digits);
-      plan.stopLoss = NormalizeDouble(stop, Digits);
-      plan.gap = NormalizeDouble(gap, Digits);
-      plan.tp3 = 0.0;
+      plan.symbol      = symbol;
+      plan.signalKey   = signal.key;
+      plan.signalType  = signal.type;
+      plan.direction   = signal.direction;
+      plan.entry       = NormalizeDouble(entry, Digits);
+      plan.stopLoss    = NormalizeDouble(stop, Digits);
+      plan.gap         = NormalizeDouble(gap, Digits);
+      plan.tp3         = 0.0;
       plan.commentBase = "TSP4 S" + IntegerToString(signal.type);
 
       if(signal.direction == TSP4_DIR_BUY)
       {
-         plan.tp1 = NormalizeDouble(plan.entry + 0.50 * plan.gap, Digits);
-         plan.tp2 = NormalizeDouble(plan.entry + 1.00 * plan.gap, Digits);
+         plan.tp1 =
+            NormalizeDouble(plan.entry + 0.50 * plan.gap, Digits);
+         plan.tp2 =
+            NormalizeDouble(plan.entry + 1.00 * plan.gap, Digits);
       }
       else
       {
-         plan.tp1 = NormalizeDouble(plan.entry - 0.50 * plan.gap, Digits);
-         plan.tp2 = NormalizeDouble(plan.entry - 1.00 * plan.gap, Digits);
+         plan.tp1 =
+            NormalizeDouble(plan.entry - 0.50 * plan.gap, Digits);
+         plan.tp2 =
+            NormalizeDouble(plan.entry - 1.00 * plan.gap, Digits);
       }
    }
 
 public:
-   void Init(int lookback, int tolerancePoints)
+   void Init(const int lookback,
+             const int tolerancePoints)
    {
-      m_lookback = lookback;
-      m_tolerancePoints = MathMax(1, tolerancePoints);
-      m_reason = "";
-      m_signalKey = 0;
-      m_direction = TSP4_DIR_NONE;
-      m_liveSAR1 = 0.0;
-      m_lastH1BarTime = 0;
-      m_previousBid = 0.0;
-      m_previousAsk = 0.0;
-      m_armed = false;
-      m_touchDetected = false;
-      m_consumed = false;
+      m_lookback         = lookback;
+      m_tolerancePoints  = MathMax(1, tolerancePoints);
+      m_reason           = "";
+      m_signalKey        = 0;
+      m_direction        = TSP4_DIR_NONE;
+      m_state            = TSP54_H1_IDLE;
+      m_lockedSAR1       = 0.0;
+      m_previousBid      = 0.0;
+      m_previousAsk      = 0.0;
+      m_lockH1BarTime    = 0;
+      m_touchTime        = 0;
+      m_consumed         = false;
    }
 
    string LastReason()
@@ -115,13 +346,46 @@ public:
       return(m_reason);
    }
 
-   void MarkConsumed(long key)
+   string StateName()
    {
-      if(m_signalKey == key)
-         m_consumed = true;
+      return(StateText(m_state));
    }
 
-   bool BuildPlanOnTouch(string symbol,
+   int State()
+   {
+      return(m_state);
+   }
+
+   double LockedSAR1()
+   {
+      return(m_lockedSAR1);
+   }
+
+   bool TouchLatched()
+   {
+      return(m_state == TSP54_H1_TOUCH_LATCHED ||
+             m_state == TSP54_H1_WAIT_PROTECTIVE_SAR0 ||
+             m_state == TSP54_H1_ENTRY_READY ||
+             m_state == TSP54_H1_CONSUMED);
+   }
+
+   void MarkConsumed(const long key)
+   {
+      if(m_signalKey != key)
+         return;
+
+      m_consumed = true;
+
+      SetState(TSP54_H1_CONSUMED,
+               "Signal entry consumed");
+
+      Print("[TSP5.4][H1_CONSUMED] key=", m_signalKey,
+            " direction=", TSP4_DirectionText(m_direction),
+            " LockedSAR1=",
+            DoubleToString(m_lockedSAR1, Digits));
+   }
+
+   bool BuildPlanOnTouch(const string symbol,
                          STSP4_Signal &signal,
                          CTSP4Indicators &ind,
                          STSP4_TradePlan &plan)
@@ -132,12 +396,24 @@ public:
          return(false);
       }
 
+      if(!DirectionIsValid(signal.direction))
+      {
+         m_reason = "Invalid signal direction";
+         return(false);
+      }
+
       RefreshRates();
 
       double currentBid = Bid;
       double currentAsk = Ask;
 
-      // A new signal starts a completely new tracker.
+      if(currentBid <= 0.0 || currentAsk <= 0.0)
+      {
+         m_reason = "Invalid Bid/Ask";
+         return(false);
+      }
+
+      // A changed key or direction creates a completely new machine.
       if(m_signalKey != signal.key ||
          m_direction != signal.direction)
       {
@@ -147,201 +423,146 @@ public:
                         currentAsk);
       }
 
-      if(m_consumed)
+      if(m_consumed ||
+         m_state == TSP54_H1_CONSUMED)
       {
          m_reason = "Signal entry already consumed";
          return(false);
       }
 
-      // SAR[1] is the penultimate point of the last closed H1 candle.
-      // Refresh it only when a new H1 candle begins. This prevents the EA
-      // from waiting indefinitely for an obsolete level.
-      datetime currentH1BarTime = iTime(symbol, PERIOD_H1, 0);
-      bool newH1Bar = (currentH1BarTime > 0 &&
-                       currentH1BarTime != m_lastH1BarTime);
-
-      if(!m_armed || (!m_touchDetected && newH1Bar))
+      // Lock once. Never overwrite m_lockedSAR1 for this signal.
+      if(m_state == TSP54_H1_WAIT_LOCK)
       {
-         double candidateSAR1 = ind.Sar(symbol, PERIOD_H1, 1);
-
-         if(candidateSAR1 <= 0.0)
-         {
-            m_reason = "Invalid live H1 SAR[1]";
-            return(false);
-         }
-
-         bool correctSide = false;
-
-         if(signal.direction == TSP4_DIR_BUY)
-            correctSide = (candidateSAR1 < currentBid);
-
-         if(signal.direction == TSP4_DIR_SELL)
-            correctSide = (candidateSAR1 > currentAsk);
-
-         bool initialArm = !m_armed;
-         SetLiveLevel(candidateSAR1,
-                      currentH1BarTime,
+         if(!LockSAR1(symbol,
+                      ind,
                       currentBid,
-                      currentAsk,
-                      initialArm);
-
-         if(!correctSide)
+                      currentAsk))
          {
-            m_reason =
-               "Waiting live SAR[1] on entry side direction=" +
-               TSP4_DirectionText(signal.direction) +
-               " LiveSAR1=" + DoubleToString(m_liveSAR1, Digits) +
-               " Bid=" + DoubleToString(currentBid, Digits) +
-               " Ask=" + DoubleToString(currentAsk, Digits);
             return(false);
          }
 
-         m_reason =
-            (initialArm ? "Armed live SAR[1]=" : "Updated live SAR[1]=") +
-            DoubleToString(m_liveSAR1, Digits) +
-            " direction=" + TSP4_DirectionText(signal.direction);
-
-         // Start crossing detection from the next tick. Comparing the price
-         // before an H1 level update with the new level can create a false touch.
+         // Touch detection starts from the next tick after locking.
          return(false);
       }
 
-      // Detect the first crossing of the current live penultimate SAR point.
-      if(!m_touchDetected)
+      if(m_state == TSP54_H1_WAIT_TOUCH)
       {
-         if(signal.direction == TSP4_DIR_BUY)
+         if(!DetectTouch(currentBid,
+                         currentAsk))
          {
-            // BUY SAR is below price: detect the first downward touch.
-            m_touchDetected =
-               (m_previousBid > m_liveSAR1 &&
-                currentBid <= m_liveSAR1);
+            return(false);
          }
+      }
 
-         if(signal.direction == TSP4_DIR_SELL)
+      // TOUCH_LATCHED intentionally falls through on the same tick.
+      if(m_state == TSP54_H1_TOUCH_LATCHED)
+      {
+         SetState(TSP54_H1_WAIT_PROTECTIVE_SAR0,
+                  "Touch latched; checking protective SAR[0]");
+      }
+
+      if(m_state == TSP54_H1_WAIT_PROTECTIVE_SAR0)
+      {
+         double sar0 = 0.0;
+         double gap  = 0.0;
+
+         if(!ProtectiveSAR0Ready(symbol,
+                                 ind,
+                                 sar0,
+                                 gap))
          {
-            // SELL SAR is above price: detect the first upward touch.
-            m_touchDetected =
-               (m_previousAsk < m_liveSAR1 &&
-                currentAsk >= m_liveSAR1);
-         }
-
-         m_previousBid = currentBid;
-         m_previousAsk = currentAsk;
-
-         if(!m_touchDetected)
-         {
-            m_reason =
-               "Waiting live SAR[1] touch direction=" +
-               TSP4_DirectionText(signal.direction) +
-               " LiveSAR1=" + DoubleToString(m_liveSAR1, Digits) +
-               " Bid=" + DoubleToString(currentBid, Digits) +
-               " Ask=" + DoubleToString(currentAsk, Digits);
             return(false);
          }
 
-         Print("[TSP4][SAR1_TOUCH] key=", signal.key,
-               " direction=", TSP4_DirectionText(signal.direction),
-               " liveSAR1=", DoubleToString(m_liveSAR1, Digits),
-               " Bid=", DoubleToString(currentBid, Digits),
-               " Ask=", DoubleToString(currentAsk, Digits));
+         FillPlan(symbol,
+                  signal,
+                  m_lockedSAR1,
+                  sar0,
+                  gap,
+                  plan);
+
+         SetState(
+            TSP54_H1_ENTRY_READY,
+            "Entry ready Entry=" +
+            DoubleToString(plan.entry, Digits) +
+            " SL=" + DoubleToString(plan.stopLoss, Digits) +
+            " Gap=" + DoubleToString(plan.gap, Digits)
+         );
+
+         Print("[TSP5.4][H1_ENTRY_READY] key=", signal.key,
+               " direction=",
+               TSP4_DirectionText(signal.direction),
+               " Entry=", DoubleToString(plan.entry, Digits),
+               " SL=", DoubleToString(plan.stopLoss, Digits),
+               " TP1=", DoubleToString(plan.tp1, Digits),
+               " TP2=", DoubleToString(plan.tp2, Digits),
+               " Gap=", DoubleToString(plan.gap, Digits));
+
+         return(true);
       }
 
-      // Final H1 direction confirmation. A BUY is valid only while the
-      // current SAR[0] is below price; a SELL only while SAR[0] is above price.
-      // The touch remains latched, so the order is not lost while waiting for
-      // valid protective geometry.
-      double sar0 = ind.Sar(symbol, PERIOD_H1, 0);
-
-      if(sar0 <= 0.0)
+      if(m_state == TSP54_H1_ENTRY_READY)
       {
-         m_reason = "Touch latched; waiting valid H1 SAR[0]";
-         return(false);
-      }
+         // Rebuild the same deterministic plan until the caller confirms
+         // successful execution through MarkConsumed().
+         double sar0 = ind.Sar(symbol, PERIOD_H1, 0);
 
-      bool sarDirectionOk = false;
+         if(sar0 <= 0.0)
+         {
+            m_reason =
+               "Entry ready but protective SAR[0] is unavailable";
+            return(false);
+         }
 
-      if(signal.direction == TSP4_DIR_BUY)
-         sarDirectionOk = (sar0 < currentBid);
+         sar0 = NormalizeDouble(sar0, Digits);
 
-      if(signal.direction == TSP4_DIR_SELL)
-         sarDirectionOk = (sar0 > currentAsk);
+         bool geometryOk = false;
 
-      if(!sarDirectionOk)
-      {
+         if(m_direction == TSP4_DIR_BUY)
+            geometryOk = (sar0 < m_lockedSAR1);
+
+         if(m_direction == TSP4_DIR_SELL)
+            geometryOk = (sar0 > m_lockedSAR1);
+
+         if(!geometryOk)
+         {
+            SetState(
+               TSP54_H1_WAIT_PROTECTIVE_SAR0,
+               "Entry geometry changed; waiting protective SAR[0]"
+            );
+            return(false);
+         }
+
+         double gap =
+            NormalizeDouble(MathAbs(m_lockedSAR1 - sar0),
+                            Digits);
+
+         if(gap <= Point)
+         {
+            SetState(
+               TSP54_H1_WAIT_PROTECTIVE_SAR0,
+               "Entry gap became invalid; waiting protective SAR[0]"
+            );
+            return(false);
+         }
+
+         FillPlan(symbol,
+                  signal,
+                  m_lockedSAR1,
+                  sar0,
+                  gap,
+                  plan);
+
          m_reason =
-            "Touch latched; H1 SAR direction blocked direction=" +
-            TSP4_DirectionText(signal.direction) +
-            " SAR0=" + DoubleToString(sar0, Digits) +
-            " Bid=" + DoubleToString(currentBid, Digits) +
-            " Ask=" + DoubleToString(currentAsk, Digits);
+            "Entry ready; waiting order execution confirmation";
 
-         Print("[TSP5][H1_SAR_DIRECTION_BLOCK] key=", signal.key,
-               " direction=", TSP4_DirectionText(signal.direction),
-               " SAR0=", DoubleToString(sar0, Digits),
-               " Bid=", DoubleToString(currentBid, Digits),
-               " Ask=", DoubleToString(currentAsk, Digits));
-         return(false);
+         return(true);
       }
-
-      // Build the initial protective geometry from the valid current SAR[0].
-
-      double brokerMinGap =
-         (MarketInfo(symbol, MODE_STOPLEVEL) + 2.0) * Point;
-
-      if(brokerMinGap < Point * 2.0)
-         brokerMinGap = Point * 2.0;
-
-      double gap = 0.0;
-
-      if(sar0 > 0.0)
-         gap = MathAbs(m_liveSAR1 - sar0);
-
-      if(gap < brokerMinGap)
-         gap = brokerMinGap;
-
-      gap = NormalizeDouble(gap, Digits);
-
-      double stop = 0.0;
-
-      if(signal.direction == TSP4_DIR_BUY)
-         stop = NormalizeDouble(m_liveSAR1 - gap, Digits);
-
-      if(signal.direction == TSP4_DIR_SELL)
-         stop = NormalizeDouble(m_liveSAR1 + gap, Digits);
-
-      if(stop <= 0.0 || gap <= Point)
-      {
-         m_reason = "Invalid immediate-entry emergency SL geometry";
-         return(false);
-      }
-
-      Print("[TSP4][INITIAL_EMERGENCY_SL] key=", signal.key,
-            " direction=", TSP4_DirectionText(signal.direction),
-            " Entry=", DoubleToString(m_liveSAR1, Digits),
-            " SAR0=", DoubleToString(sar0, Digits),
-            " EmergencySL=", DoubleToString(stop, Digits),
-            " Gap=", DoubleToString(gap, Digits));
-
-      FillPlan(symbol,
-               signal,
-               m_liveSAR1,
-               stop,
-               gap,
-               plan);
 
       m_reason =
-         "Immediate live SAR[1] touch entry ready Entry=" +
-         DoubleToString(plan.entry, Digits) +
-         " SL=" + DoubleToString(plan.stopLoss, Digits) +
-         " Gap=" + DoubleToString(plan.gap, Digits);
+         "H1 state not ready: " + StateText(m_state);
 
-      Print("[TSP4][SAR1_IMMEDIATE_ENTRY_READY] key=", signal.key,
-            " direction=", TSP4_DirectionText(signal.direction),
-            " Entry=", DoubleToString(plan.entry, Digits),
-            " SL=", DoubleToString(plan.stopLoss, Digits),
-            " Gap=", DoubleToString(plan.gap, Digits));
-
-      return(true);
+      return(false);
    }
 };
 
